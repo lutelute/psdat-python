@@ -58,11 +58,11 @@ def compute_internal_emf(
         Vt = Vg[g] * np.exp(1j * theta_g[g])
         Sg = complex(PG[g], QG[g])
         Ig = np.conj(Sg / Vt)
-        # Classical model: use Eq = Vt + jXq*I as constant internal voltage.
-        # This gives correct power balance at operating point.
-        E_q = Vt + complex(p.Rs, p.Xq) * Ig
-        E_prime[g] = E_q
-        delta_0[g] = np.angle(E_q)
+        # Classical model: E' = Vt + jXd'*I  (Anderson & Fouad Ch. 2.4, Kundur Ch. 15)
+        # E' is the transient EMF (constant during transient) behind X'd.
+        E_p = Vt + complex(p.Rs, p.Xdp) * Ig
+        E_prime[g] = E_p
+        delta_0[g] = np.angle(E_p)
 
     return E_prime, delta_0
 
@@ -160,8 +160,8 @@ def simulate_classical(
         for g, gb in enumerate(gen_buses):
             bi  = gb - 1
             igi = n_buses + g   # internal bus index
-            # Use Xq to match the classical model's Eq = Vt + jXq*I
-            y_g = 1.0 / complex(machines[g].Rs, max(machines[g].Xq, 1e-6))
+            # Use Xd' (transient) to match E' = Vt + jXd'*I classical model
+            y_g = 1.0 / complex(machines[g].Rs, max(machines[g].Xdp, 1e-6))
             Y_ext[bi,  bi]   += y_g
             Y_ext[igi, igi]  += y_g
             Y_ext[bi,  igi]  -= y_g
@@ -208,6 +208,19 @@ def simulate_classical(
                 Pe[i] += (E_mag[i] * E_mag[j] *
                           (Gij * np.cos(dij) + Bij * np.sin(dij)))
         return Pe
+
+    # Ensure pre-fault equilibrium: constant-Z load model shifts Pe slightly
+    # from PG, so set Pm = Pe(δ₀) to guarantee zero initial acceleration.
+    Pm = electrical_power(delta_0, Y_red_pre)
+
+    # Diagnostic: check Pm vs PG
+    _max_mismatch = np.max(np.abs(Pm - PG))
+    if _max_mismatch > 0.5:
+        print(f"[classical] WARN: large initial Pm-PG mismatch (max={_max_mismatch:.3f} pu)")
+        for _i in range(n_gen):
+            if abs(Pm[_i] - PG[_i]) > 0.1:
+                print(f"  Gen {_i+1}: Pm={Pm[_i]:.4f}, PG={PG[_i]:.4f}, "
+                      f"|E|={E_mag[_i]:.4f}, δ₀={np.degrees(delta_0[_i]):.2f}°")
 
     def swing_rhs(delta: np.ndarray, omega: np.ndarray,
                   Y_red: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
