@@ -470,8 +470,27 @@ def _run_pf_matpower(
         except np.linalg.LinAlgError:
             break
 
-        Vang[pvpq_idx] += dx[:npvpq]
-        Vmag[pq_idx]   *= (1.0 + dx[npvpq:])
+        # Backtracking line search: ensure the mismatch decreases
+        alpha = 1.0
+        mis0  = np.max(np.abs(F))
+        for _ in range(10):
+            dth = np.clip(dx[:npvpq] * alpha, -np.pi, np.pi)
+            dv  = np.clip(dx[npvpq:] * alpha, -0.5, 0.5)
+            Vang_t = Vang.copy(); Vang_t[pvpq_idx] += dth
+            Vmag_t = Vmag.copy(); Vmag_t[pq_idx]   *= (1.0 + dv)
+            Vmag_t = np.maximum(Vmag_t, 0.01)   # voltage floor
+            V_t    = Vmag_t * np.exp(1j * Vang_t)
+            S_t    = V_t * np.conj(Ybus @ V_t)
+            F_t    = np.concatenate([
+                (P_sched - S_t.real)[pvpq_idx],
+                (Q_sched - S_t.imag)[pq_idx],
+            ])
+            if np.max(np.abs(F_t)) < mis0:
+                break
+            alpha *= 0.5
+        Vang[pvpq_idx] += np.clip(dx[:npvpq] * alpha, -np.pi, np.pi)
+        Vmag[pq_idx]   *= (1.0 + np.clip(dx[npvpq:] * alpha, -0.5, 0.5))
+        Vmag = np.maximum(Vmag, 0.01)
     else:
         iterations = max_iter
 
