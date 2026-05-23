@@ -62,6 +62,8 @@ References:
 from __future__ import annotations
 
 import numpy as np
+import scipy.sparse as sps
+import scipy.sparse.linalg as spla
 from typing import Dict, Optional, Tuple
 
 
@@ -203,6 +205,267 @@ def _build_ybus_matpower(
 
 
 # ---------------------------------------------------------------------------
+# Sparse Y-bus and Jacobian (for large systems)
+# ---------------------------------------------------------------------------
+
+def _build_ybus_sparse(
+    buses: np.ndarray,
+    branches: np.ndarray,
+    baseMVA: float,
+) -> sps.csr_matrix:
+    """Build Y-bus as a scipy.sparse CSR matrix (efficient for large networks)."""
+    n  = buses.shape[0]
+    nl = branches.shape[0]
+    bus_nums = buses[:, 0].astype(int)
+    bus_idx  = {b: i for i, b in enumerate(bus_nums)}
+
+    rows, cols, data = [], [], []
+
+    # Bus shunts
+    for i in range(n):
+        GS = buses[i, 4] / baseMVA
+        BS = buses[i, 5] / baseMVA
+        rows.append(i); cols.append(i); data.append(GS + 1j * BS)
+
+    # Branches
+    for k in range(nl):
+        br_status = int(branches[k, 10]) if branches.shape[1] > 10 else 1
+        if br_status == 0:
+            continue
+        fi = bus_idx[int(branches[k, 0])]
+        ti = bus_idx[int(branches[k, 1])]
+        R   = branches[k, 2]; X = branches[k, 3]; B = branches[k, 4]
+        tap = branches[k, 8] if branches[k, 8] != 0.0 else 1.0
+        shift = branches[k, 9] if branches.shape[1] > 9 else 0.0
+        a   = tap * np.exp(1j * np.deg2rad(shift))
+        z   = R + 1j * X
+        y_s = (1.0 / z) if abs(z) > 1e-15 else (1e10 + 0j)
+        y_c = 1j * B / 2.0
+
+        rows += [fi, ti, fi, ti]
+        cols += [fi, ti, ti, fi]
+        data += [(y_s + y_c) / (tap * tap), y_s + y_c,
+                 -y_s / np.conj(a), -y_s / a]
+
+    Y = sps.coo_matrix((data, (rows, cols)), shape=(n, n), dtype=complex)
+    return Y.tocsr()
+
+
+def _sparse_jacobian(
+    Ybus: sps.csr_matrix,
+    V: np.ndarray,
+    pvpq: np.ndarray,
+    pq: np.ndarray,
+) -> "tuple[sps.csr_matrix, np.ndarray, np.ndarray]":
+    """Build sparse polar-form Jacobian.
+
+    Uses vectorised COO assembly — O(nnz) instead of O(n²).
+
+    Returns
+    -------
+    J : csr_matrix   shape (n_pvpq + n_pq) × (n_pvpq + n_pq)
+    P : ndarray      real power injection
+    Q : ndarray      reactive power injection
+    """
+    n      = len(V)
+    Vmag   = np.abs(V)
+    Vang   = np.angle(V)
+
+    I_bus  = Ybus @ V
+    S_bus  = V * np.conj(I_bus)
+    P      = S_bus.real
+    Q      = S_bus.imag
+
+    # Extract COO entries of Y-bus
+    Ycoo  = Ybus.tocoo()
+    ry, cy = Ycoo.row, Ycoo.col
+    G_y   = Ycoo.data.real
+    B_y   = Ycoo.data.imag
+
+    th    = Vang[ry] - Vang[cy]
+    ViVj  = Vmag[ry] * Vmag[cy]
+    sin_t = np.sin(th)
+    cos_t = np.cos(th)
+
+    H_all = ViVj * (G_y * sin_t - B_y * cos_t)   # dP/dθ off-diag
+    N_all = ViVj * (G_y * cos_t + B_y * sin_t)   # dP/dV·V off-diag
+
+    # Diagonal of Y (scalar arrays, length n)
+    Yd    = np.asarray(Ybus.diagonal())
+    B_d   = Yd.imag
+    G_d   = Yd.real
+
+    # Vectorised index maps: bus index → local pvpq/pq index (-1 if absent)
+    pvpq_loc = np.full(n, -1, dtype=int)
+    pvpq_loc[pvpq] = np.arange(len(pvpq))
+    pq_loc = np.full(n, -1, dtype=int)
+    pq_loc[pq] = np.arange(len(pq))
+    pq_in_pvpq = pvpq_loc[pq]   # row in pvpq block for each PQ bus
+
+    n_pvpq = len(pvpq);  n_pq = len(pq)
+    total  = n_pvpq + n_pq
+
+    od  = ry != cy           # off-diagonal mask
+    r_od, c_od = ry[od], cy[od]
+    H_od = H_all[od]
+    N_od = N_all[od]
+
+    # Diagonal values (only for included buses)
+    H_d_vals = -Q[pvpq] - B_d[pvpq] * Vmag[pvpq] ** 2
+    N_d_vals =  P[pq]   + G_d[pq]   * Vmag[pq]   ** 2
+    J_d_vals =  P[pq]   - G_d[pq]   * Vmag[pq]   ** 2
+    L_d_vals =  Q[pq]   - B_d[pq]   * Vmag[pq]   ** 2
+
+    # ── H block (pvpq × pvpq): dP/dθ ────────────────────────────────────
+    r_h = pvpq_loc[r_od]; c_h = pvpq_loc[c_od]
+    mh  = (r_h >= 0) & (c_h >= 0)
+    H_r = np.r_[r_h[mh], np.arange(n_pvpq)]
+    H_c = np.r_[c_h[mh], np.arange(n_pvpq)]
+    H_v = np.r_[H_od[mh], H_d_vals]
+
+    # ── N block (pvpq × pq): dP/dV·V ────────────────────────────────────
+    r_n = pvpq_loc[r_od]; c_n = pq_loc[c_od]
+    mn  = (r_n >= 0) & (c_n >= 0)
+    N_r = np.r_[r_n[mn], pq_in_pvpq]
+    N_c = np.r_[c_n[mn], np.arange(n_pq)]
+    N_v = np.r_[N_od[mn], N_d_vals]
+
+    # ── Jm block (pq × pvpq): dQ/dθ ─────────────────────────────────────
+    r_j = pq_loc[r_od]; c_j = pvpq_loc[c_od]
+    mj  = (r_j >= 0) & (c_j >= 0)
+    Jm_r = np.r_[r_j[mj], np.arange(n_pq)]
+    Jm_c = np.r_[c_j[mj], pq_in_pvpq]
+    Jm_v = np.r_[-N_od[mj], J_d_vals]   # dQ/dθ = -dP/dV·V (off-diag)
+
+    # ── L block (pq × pq): dQ/dV·V ───────────────────────────────────────
+    r_l = pq_loc[r_od]; c_l = pq_loc[c_od]
+    ml  = (r_l >= 0) & (c_l >= 0)
+    L_r = np.r_[r_l[ml], np.arange(n_pq)]
+    L_c = np.r_[c_l[ml], np.arange(n_pq)]
+    L_v = np.r_[H_od[ml], L_d_vals]   # dQ/dV·V = dP/dθ (off-diag)
+
+    # Stack into full Jacobian using block offsets
+    all_r = np.r_[H_r,           N_r,           Jm_r + n_pvpq,   L_r + n_pvpq]
+    all_c = np.r_[H_c,           N_c + n_pvpq,  Jm_c,            L_c + n_pvpq]
+    all_v = np.r_[H_v,           N_v,           Jm_v,            L_v          ]
+
+    J = sps.coo_matrix((all_v, (all_r, all_c)), shape=(total, total)).tocsr()
+    return J, P, Q
+
+
+def _run_pf_sparse(
+    buses:      np.ndarray,
+    branches:   np.ndarray,
+    generators: np.ndarray,
+    baseMVA:    float,
+    tol:        float,
+    max_iter:   int,
+) -> Dict:
+    """Sparse Newton-Raphson power flow (for large systems ≥ 300 buses)."""
+    n  = buses.shape[0]
+    ng = generators.shape[0] if generators is not None else 0
+
+    bus_nums = buses[:, 0].astype(int)
+    bus_idx  = {b: i for i, b in enumerate(bus_nums)}
+    bus_type = buses[:, 1].astype(int)
+
+    slack_i  = np.where(bus_type == 3)[0]
+    pv_i     = np.where(bus_type == 2)[0]
+    pq_i     = np.where(bus_type == 1)[0]
+    pvpq     = np.concatenate([pv_i, pq_i])
+
+    Vmag = buses[:, 7].copy()
+    Vang = np.deg2rad(buses[:, 8].copy())
+
+    P_sched = -buses[:, 2] / baseMVA
+    Q_sched = -buses[:, 3] / baseMVA
+
+    if generators is not None:
+        for g in range(ng):
+            gs = int(generators[g, 7]) if generators.shape[1] > 7 else 1
+            if gs == 0:
+                continue
+            gi = bus_idx[int(generators[g, 0])]
+            P_sched[gi] += generators[g, 1] / baseMVA
+            if bus_type[gi] in (2, 3):
+                Vmag[gi] = generators[g, 5]
+            else:
+                Q_sched[gi] += generators[g, 2] / baseMVA
+
+    Ybus = _build_ybus_sparse(buses, branches, baseMVA)
+
+    converged  = False
+    iterations = 0
+
+    for _it in range(max_iter):
+        V = Vmag * np.exp(1j * Vang)
+        J, P_calc, Q_calc = _sparse_jacobian(Ybus, V, pvpq, pq_i)
+
+        dP = (P_sched - P_calc)[pvpq]
+        dQ = (Q_sched - Q_calc)[pq_i]
+        F  = np.r_[dP, dQ]
+        mis = float(np.max(np.abs(F)))
+        if mis < tol:
+            converged  = True
+            iterations = _it
+            break
+
+        try:
+            dx = spla.spsolve(J, F)
+        except Exception:
+            break
+
+        n_pvpq = len(pvpq)
+        # Backtracking Armijo line search
+        alpha = 1.0
+        for _ in range(10):
+            Vang_t = Vang.copy()
+            Vmag_t = Vmag.copy()
+            Vang_t[pvpq] += np.clip(dx[:n_pvpq] * alpha, -np.pi, np.pi)
+            Vmag_t[pq_i] *= np.maximum(1.0 + np.clip(dx[n_pvpq:] * alpha, -0.5, 0.5), 0.01)
+            Vmag_t = np.maximum(Vmag_t, 0.01)
+            Vt     = Vmag_t * np.exp(1j * Vang_t)
+            _, P_t, Q_t = _sparse_jacobian(Ybus, Vt, pvpq, pq_i)
+            Ft = np.r_[(P_sched - P_t)[pvpq], (Q_sched - Q_t)[pq_i]]
+            if np.max(np.abs(Ft)) < mis:
+                break
+            alpha *= 0.5
+        Vang[pvpq] += np.clip(dx[:n_pvpq] * alpha, -np.pi, np.pi)
+        Vmag[pq_i] *= np.maximum(1.0 + np.clip(dx[n_pvpq:] * alpha, -0.5, 0.5), 0.01)
+        Vmag = np.maximum(Vmag, 0.01)
+    else:
+        iterations = max_iter
+
+    V_sol   = Vmag * np.exp(1j * Vang)
+    S_final = V_sol * np.conj(Ybus @ V_sol)
+    dP_f    = (P_sched - S_final.real)[pvpq]
+    dQ_f    = (Q_sched - S_final.imag)[pq_i]
+    mismatch = float(np.max(np.abs(np.r_[dP_f, dQ_f]))) if n > 1 else 0.0
+
+    P_gen = np.zeros(ng); Q_gen = np.zeros(ng)
+    if generators is not None:
+        for g in range(ng):
+            gi = bus_idx[int(generators[g, 0])]
+            P_gen[g] = generators[g, 1] / baseMVA
+            if bus_type[gi] in (2, 3):
+                Q_gen[g] = S_final[gi].imag + buses[gi, 3] / baseMVA
+
+    return {
+        'V':          V_sol,
+        'Vmag':       Vmag,
+        'Vang_deg':   np.degrees(Vang),
+        'P_gen':      P_gen,
+        'Q_gen':      Q_gen,
+        'P_inj':      S_final.real,
+        'Q_inj':      S_final.imag,
+        'converged':  converged,
+        'iterations': iterations,
+        'mismatch':   mismatch,
+        'Ybus':       Ybus,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Newton-Raphson power flow
 # ---------------------------------------------------------------------------
 
@@ -267,10 +530,17 @@ def run_powerflow(
         )
         return V, S_inj, n_iter, conv
     else:
+        buses_arr = np.asarray(buses_or_bus_data,      dtype=float)
+        brchs_arr = np.asarray(branches_or_branch_data, dtype=float)
+        gens_arr  = np.asarray(generators,              dtype=float)
+        # Use sparse solver for large systems (≥ 300 buses) — O(nnz) Jacobian
+        if buses_arr.shape[0] >= 300:
+            return _run_pf_sparse(
+                buses_arr, brchs_arr, gens_arr,
+                baseMVA=baseMVA, tol=tol, max_iter=max_iter,
+            )
         return _run_pf_matpower(
-            np.asarray(buses_or_bus_data,      dtype=float),
-            np.asarray(branches_or_branch_data, dtype=float),
-            np.asarray(generators,              dtype=float),
+            buses_arr, brchs_arr, gens_arr,
             baseMVA=baseMVA, tol=tol, max_iter=max_iter,
         )
 
